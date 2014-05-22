@@ -1,8 +1,11 @@
 #include <iostream>
 #include <pcl/io/pcd_io.h>
+#include <pcl/io/vtk_lib_io.h>
+#include <vtkPNGWriter.h>
 #include <pcl/features/integral_image_normal.h>
 #include <pcl/segmentation/organized_multi_plane_segmentation.h>
-#include "rgb_euclidean_cluster_comparator.h"
+#include <pcl/segmentation/euclidean_cluster_comparator.h>
+//#include "rgb_euclidean_cluster_comparator.h"
 #include <pcl/segmentation/organized_connected_component_segmentation.h>
 #include <pcl/visualization/pcl_visualizer.h>
 
@@ -12,8 +15,46 @@ typedef Cloud::ConstPtr CloudConstPtr;
 
 boost::shared_ptr<pcl::visualization::PCLVisualizer> viewer (new pcl::visualization::PCLVisualizer);
 
+/** \brief Sum of image data values with given indices. */
+float
+image_data_sum (const vtkSmartPointer<vtkImageData> &image_data, const std::vector<int> &indices)
+{
+  float sum = 0.0f;
+  int dimensions[3];
+  int x, y;
+
+  image_data->GetDimensions (dimensions);
+
+  for (std::vector<int>::const_iterator it = indices.begin (); it != indices.end (); ++it)
+  {
+    x = (*it) % (dimensions[0]);
+    y = (*it) / (dimensions[0]);
+    sum += image_data->GetScalarComponentAsFloat (x, dimensions[1] - y - 1, 0, 0);
+  }
+
+  return sum;
+}
+
+/** \brief Set every image data of given indices with given value */
 void
-cloud_cb (const CloudConstPtr &cloud)
+set_image_data (const vtkSmartPointer<vtkImageData> &image_data,
+                const std::vector<int> &indices, float value)
+{
+  int dimensions[3];
+  int x, y;
+
+  image_data->GetDimensions (dimensions);
+
+  for (std::vector<int>::const_iterator it = indices.begin (); it != indices.end (); ++it)
+  {
+    x = (*it) % (dimensions[0]);
+    y = (*it) / (dimensions[0]);
+    image_data->SetScalarComponentFromFloat (x, dimensions[1] - y - 1, 0, 0, value);
+  }
+}
+
+void
+cloud_cb (const CloudConstPtr &cloud, const vtkSmartPointer<vtkImageData> &stage3_image_data)
 {
   // Show Cloud
   viewer->removeAllPointClouds ();
@@ -80,13 +121,13 @@ cloud_cb (const CloudConstPtr &cloud)
       plane_labels[i] = true;
     }
   }
-  pcl::RGBEuclideanClusterComparator<PointT, pcl::Normal, pcl::Label>::Ptr comparator (
-      new pcl::RGBEuclideanClusterComparator<PointT, pcl::Normal, pcl::Label>);
+  pcl::EuclideanClusterComparator<PointT, pcl::Normal, pcl::Label>::Ptr comparator (
+      new pcl::EuclideanClusterComparator<PointT, pcl::Normal, pcl::Label>);
   comparator->setInputCloud (cloud);
   comparator->setLabels (labels);
   comparator->setExcludeLabels (plane_labels);
   comparator->setDistanceThreshold (0.01f, false);
-  comparator->setColorThreshold (18.0f);
+//  comparator->setColorThreshold (18.0f);
   pcl::PointCloud<pcl::Label> euclidean_labels;
   std::vector<pcl::PointIndices> euclidean_label_indices;
   pcl::OrganizedConnectedComponentSegmentation<PointT, pcl::Label> euclidean_segment (comparator);
@@ -115,24 +156,84 @@ cloud_cb (const CloudConstPtr &cloud)
           pcl::visualization::PCL_VISUALIZER_OPACITY, 0.3, name);
     }
   }
+
+  /* stage 4: use segmentation information to refine saliency map */
+
+  // planes
+  for (std::vector<pcl::PointIndices>::const_iterator it = label_indices.begin ();
+      it != label_indices.end (); ++it)
+  {
+    std::vector<int> indices = it->indices;
+    int sum;
+
+    if (indices.size () > 1)
+    {
+      sum = image_data_sum (stage3_image_data, indices);
+      set_image_data (stage3_image_data, indices, sum / indices.size ());
+    }
+  }
+
+  // objects
+  for (std::vector<pcl::PointIndices>::const_iterator it = euclidean_label_indices.begin ();
+      it != euclidean_label_indices.end (); ++it)
+  {
+    std::vector<int> indices = it->indices;
+    int sum;
+
+    if (indices.size () > 1)
+    {
+      sum = image_data_sum (stage3_image_data, indices);
+      set_image_data (stage3_image_data, indices, sum / indices.size ());
+    }
+  }
 }
 
 int
 main (int argc, char **argv)
 {
-    viewer->setCameraPosition (4.69428, 0.180855, -1.8609,
-                               -1.54299, -1.6422, 5.1925,
-                               0.133867, -0.981711, -0.13536);
-    pcl::PointCloud<PointT>::Ptr cloud (new pcl::PointCloud<PointT>);
-    if (pcl::io::loadPCDFile (argv[1], *cloud) != 0)
-    {
-      std::cerr << "can't find pcd file" << std::endl;
-      return -1;
-    }
-    cloud_cb (cloud);
-    while (!viewer->wasStopped ())
-    {
-      viewer->spinOnce (100);
-    }
-    return 0;
+  viewer->setCameraPosition (4.69428, 0.180855, -1.8609,
+                             -1.54299, -1.6422, 5.1925,
+                             0.133867, -0.981711, -0.13536);
+
+  // load pcd file
+  pcl::PointCloud<PointT>::Ptr cloud (new pcl::PointCloud<PointT>);
+  if (pcl::io::loadPCDFile (argv[1], *cloud) != 0)
+  {
+    std::cerr << "can't find pcd file" << std::endl;
+    return -1;
+  }
+
+  // load stage 3 png file
+  vtkSmartPointer<vtkImageData> image_data;
+  vtkSmartPointer<vtkPNGReader> image_reader = vtkSmartPointer<vtkPNGReader>::New ();
+  int dimensions[3];
+  image_reader->SetFileName (argv[2]);
+  image_data = image_reader->GetOutput ();
+  image_data->Update ();
+  image_data->GetDimensions (dimensions);
+  if (dimensions[0] <= 0 || dimensions[1] <= 0)
+  {
+    std::cerr << "read input saliency image error." << std::endl;
+    return -1;
+  }
+  if (image_data->GetNumberOfScalarComponents () != 1)
+  {
+    std::cerr << "components of input saliency image not equal to 1." << std::endl;
+    return -1;
+  }
+
+  // stage 4
+  cloud_cb (cloud, image_data);
+
+  // write stage 4 png file
+  vtkSmartPointer<vtkPNGWriter> image_writer = vtkSmartPointer<vtkPNGWriter>::New ();
+  image_writer->SetFileName (argv[3]);
+  image_writer->SetInput (image_data);
+  image_writer->Write ();
+
+  while (!viewer->wasStopped ())
+  {
+    viewer->spinOnce (100);
+  }
+  return 0;
 }
